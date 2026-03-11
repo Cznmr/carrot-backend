@@ -20,7 +20,9 @@ const optionalEnvVars = {
   NODE_ENV:            'production',
   GEMINI_CHAT_MODEL:   'gemini-2.5-flash',
   GEMINI_TTS_MODEL:    'gemini-2.5-flash-preview-tts',
-  TTS_VOICE_NAME:      'Leda'
+  TTS_VOICE_NAME:      'Leda',
+  SESSION_TTL_SEC:     1800,   // 30 min — session memory expires after inactivity
+  MAX_HISTORY_TURNS:   10      // keep last 10 exchanges to avoid huge context windows
 };
 
 requiredEnvVars.forEach(varName => {
@@ -43,7 +45,19 @@ const port  = process.env.PORT;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
 // Cache text answers only — never audio blobs (memory safety)
-const textCache = new NodeCache({ stdTTL: 300 }); // 5 min TTL
+const textCache = new NodeCache({ stdTTL: 300 }); // 5 min TTL for repeated questions
+
+// ── Session Memory Store ───────────────────────────────────────────────────
+// Stores conversation history per session so Carrot remembers past exchanges.
+// Key: sessionId (string)
+// Value: array of { role: 'user'|'model', parts: [{ text }] }
+//
+// Sessions expire after SESSION_TTL_SEC seconds of inactivity.
+// Only the last MAX_HISTORY_TURNS exchanges are kept to control context size.
+const sessionStore = new NodeCache({
+  stdTTL:      parseInt(process.env.SESSION_TTL_SEC),
+  checkperiod: 120   // clean up expired sessions every 2 minutes
+});
 
 // ── Custom Error Class ─────────────────────────────────────────────────────
 class CarrotError extends Error {
@@ -87,8 +101,7 @@ app.use(helmet({
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }
 }));
 
-// FIX #1 — 2mb limit: Base64 encoding adds ~33% overhead over raw audio.
-// 5s INMP441 recording ≈ 160KB raw → ~213KB Base64. 2mb gives safe headroom.
+// 2mb limit — enough for ~5s INMP441 audio as Base64
 app.use(express.json({ limit: '2mb' }));
 
 // ── Request ID Middleware ──────────────────────────────────────────────────
@@ -144,10 +157,34 @@ const withTimeout = (promise, ms = parseInt(process.env.REQUEST_TIMEOUT_MS)) =>
     )
   ]);
 
+// ── Session History Helpers ────────────────────────────────────────────────
+
+// Get existing history for a session, or start fresh
+function getHistory(sessionId) {
+  return sessionStore.get(sessionId) || [];
+}
+
+// Append a user turn and a model turn, then trim to MAX_HISTORY_TURNS
+// Each "turn" = one user message + one model reply = 2 entries
+function saveHistory(sessionId, userText, modelText) {
+  const maxTurns   = parseInt(process.env.MAX_HISTORY_TURNS); // exchanges
+  let   history    = getHistory(sessionId);
+
+  // Append new exchange
+  history.push({ role: 'user',  parts: [{ text: userText  }] });
+  history.push({ role: 'model', parts: [{ text: modelText }] });
+
+  // Trim oldest turns if over limit (each turn = 2 entries)
+  const maxEntries = maxTurns * 2;
+  if (history.length > maxEntries) {
+    history = history.slice(history.length - maxEntries);
+  }
+
+  // Reset TTL on every update so active sessions stay alive
+  sessionStore.set(sessionId, history);
+}
+
 // ── Robot Commands (Offline / Local ESP32 Mode) ────────────────────────────
-// FIX #2 — Each command has multiple keyword variants to handle natural
-// speech differences from STT (e.g. "go forward" vs "move forward").
-// Uses an array instead of Map so we can check multiple keywords per command.
 const ROBOT_COMMANDS = [
   {
     keywords: ['move forward', 'go forward', 'forward', 'move ahead', 'go ahead'],
@@ -181,15 +218,22 @@ const ROBOT_COMMANDS = [
 
 // ── POST /ask ──────────────────────────────────────────────────────────────
 // Accepts either:
-//   { audioData: "<base64>", mimeType: "audio/wav" }  ← from INMP441 via ESP32
-//   { question:  "hey carrot what is AI" }            ← text (Postman / testing)
+//   { audioData: "<base64>", mimeType: "audio/wav", sessionId: "abc" }
+//   { question:  "hey carrot what is AI",           sessionId: "abc" }
+//
+// sessionId is optional — if omitted, a new session is created each request
+// (no memory). ESP32 should generate one UUID on boot and reuse it.
 app.post('/ask', async (req, res) => {
   try {
     const {
       question,
       audioData: incomingAudio,  // Base64 audio from ESP32 INMP441
-      mimeType:  incomingMime    // e.g. "audio/wav"
+      mimeType:  incomingMime,   // e.g. "audio/wav"
+      sessionId: clientSessionId // ESP32 sends this to maintain memory
     } = req.body;
+
+    // Use provided sessionId or generate a new one for this request
+    const sessionId = clientSessionId || uuidv4();
 
     // ── STEP 0: "The Ear" — STT via Gemini multimodal ─────────────────────
     let transcribedText = '';
@@ -209,19 +253,19 @@ app.post('/ask', async (req, res) => {
             }
           }
         ]),
-        parseInt(process.env.STT_TIMEOUT_MS) // STT gets extra time — audio is slower
+        parseInt(process.env.STT_TIMEOUT_MS)
       );
 
       transcribedText = sttResult.response.text()?.trim() || '';
       console.log(`[${req.id}] STT result: "${transcribedText}"`);
 
-      // STT produced no text — send OLED-safe fallback so screen never goes blank
       if (!transcribedText) {
         return res.json({
           answer:    "Sorry, I didn't catch that. Please try again!",
           audio:     null,
           mimeType:  null,
           type:      'stt_failure',
+          sessionId,
           requestId: req.id
         });
       }
@@ -239,23 +283,16 @@ app.post('/ask', async (req, res) => {
 
     // Normalise — lowercase, strip punctuation, trim
     const cleanQ = transcribedText.toLowerCase().replace(/[.,!?]/g, '').trim();
-    console.log(`[${req.id}] Cleaned input: "${cleanQ}"`);
-
-    // ── ROUTING ────────────────────────────────────────────────────────────
-    //
-    //  "carrot move forward"  → OFFLINE / LOCAL MODE  (no API call, instant)
-    //  "hey carrot what is X" → AI MODE               (Brain + TTS)
-    //  anything else          → AI MODE               (safe default)
+    console.log(`[${req.id}] [session:${sessionId}] Cleaned input: "${cleanQ}"`);
 
     // ── ROUTE 1: OFFLINE / LOCAL COMMAND MODE ─────────────────────────────
+    // Robot commands don't need memory — they are instant physical actions
     if (cleanQ.startsWith('carrot') && !cleanQ.startsWith('hey carrot')) {
       console.log(`[${req.id}] Route: LOCAL COMMAND MODE`);
 
-      // Strip wake word to isolate the command phrase
       const isolatedCommand = cleanQ.replace(/^carrot\s*/, '').trim();
       console.log(`[${req.id}] Isolated command: "${isolatedCommand}"`);
 
-      // FIX #2 — Match against all keyword variants per command
       const matched = ROBOT_COMMANDS.find(entry =>
         entry.keywords.some(k => isolatedCommand.includes(k))
       );
@@ -263,54 +300,94 @@ app.post('/ask', async (req, res) => {
       if (matched) {
         console.log(`[${req.id}] Matched command: ${matched.command.command}`);
         return res.json({
-          answer:    `Executing: ${matched.command.command}`, // Short text for OLED
-          command:   matched.command,                         // Full data for ESP32
-          audio:     null,   // No audio in local mode — servo/OLED stays instant
+          answer:    `Executing: ${matched.command.command}`,
+          command:   matched.command,
+          audio:     null,
           mimeType:  null,
           type:      'robot_command',
+          sessionId,
           requestId: req.id
         });
       }
 
-      // Wake word matched but no command found — fall through to AI mode
       console.log(`[${req.id}] No command matched — falling back to AI mode`);
     }
 
-    // ── ROUTE 2: AI BRAIN MODE ─────────────────────────────────────────────
+    // ── ROUTE 2: AI BRAIN MODE (with conversation memory) ─────────────────
     console.log(`[${req.id}] Route: AI BRAIN MODE`);
 
-    // Strip all wake words so AI only sees the actual question
+    // Strip wake words so AI only sees the actual question
     const actualQuestion = cleanQ
       .replace(/^hey carrot\s*/, '')
       .replace(/^carrot\s*/, '')
       .trim() || cleanQ;
 
-    // ── STEP 1: "The Brain" — generate text answer (cached) ───────────────
-    const cacheKey   = `q:${actualQuestion}`;
-    const cachedText = textCache.get(cacheKey);
+    // ── STEP 1: "The Brain" — generate answer with full conversation history
+    // Load this session's conversation history
+    const history = getHistory(sessionId);
+    console.log(`[${req.id}] [session:${sessionId}] History length: ${history.length} entries`);
+
+    // System instruction — defines Carrot's personality and memory behaviour
+    const systemInstruction = `You are Carrot, a cute and friendly robot companion.
+You have a memory — you remember everything said earlier in this conversation.
+If the user refers to something previously mentioned (like a name, fact, or topic), use that context in your reply.
+Reply in MAXIMUM 15 words. Keep it cheerful and simple.`;
+
+    // Build the full conversation to send to Gemini:
+    // [system context as first user turn] + [history] + [new question]
+    const contents = [
+      // Inject system personality as the very first exchange so it's always in context
+      {
+        role:  'user',
+        parts: [{ text: systemInstruction }]
+      },
+      {
+        role:  'model',
+        parts: [{ text: "Got it! I'm Carrot, your friendly robot companion. I'll remember our conversation!" }]
+      },
+      // All previous turns for this session
+      ...history,
+      // The new question from the user
+      {
+        role:  'user',
+        parts: [{ text: actualQuestion }]
+      }
+    ];
+
+    // Note: skip text cache for sessions with history — context changes the answer
+    const shouldUseCache = history.length === 0;
+    const cacheKey       = `q:${actualQuestion}`;
     let   answerText;
 
-    if (cachedText) {
-      console.log(`[${req.id}] Cache hit — reusing answer`);
-      metrics.cacheHits++;
-      answerText = cachedText;
-    } else {
+    if (shouldUseCache) {
+      const cachedText = textCache.get(cacheKey);
+      if (cachedText) {
+        console.log(`[${req.id}] Cache hit — reusing answer (no history)`);
+        metrics.cacheHits++;
+        answerText = cachedText;
+      }
+    }
+
+    if (!answerText) {
       const chatModel  = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
-      const chatPrompt = `You are Carrot, a cute and friendly robot companion.
-Reply in MAXIMUM 15 words. Keep it cheerful and simple.
-User Question: ${actualQuestion}`;
+      const chatResult = await withTimeout(
+        chatModel.generateContent({ contents })
+      );
 
-      const chatResult = await withTimeout(chatModel.generateContent(chatPrompt));
       answerText = chatResult.response.text()?.trim();
-
       if (!answerText) {
         answerText = "Sorry, I couldn't think of an answer!";
       }
 
-      textCache.set(cacheKey, answerText);
+      // Only cache if this is a fresh session (no prior context)
+      if (shouldUseCache) {
+        textCache.set(cacheKey, answerText);
+      }
     }
 
-    console.log(`[${req.id}] Brain answer: "${answerText}"`);
+    // Save this exchange to session memory for future requests
+    saveHistory(sessionId, actualQuestion, answerText);
+    console.log(`[${req.id}] [session:${sessionId}] Brain answer: "${answerText}"`);
 
     // ── STEP 2: "The Voice Box" — convert answer to audio (non-fatal) ──────
     let outAudio    = null;
@@ -339,9 +416,7 @@ User Question: ${actualQuestion}`;
         outAudio    = audioPart.inlineData.data;
         outMimeType = audioPart.inlineData.mimeType;
 
-        // FIX #3 — Safety cap: if audio blob exceeds ~375KB Base64
-        // (i.e. >500000 chars), it's too large for ESP32 to buffer safely.
-        // Drop it and let OLED display the text answer instead.
+        // Safety cap — drop audio if too large for ESP32 to buffer
         if (outAudio.length > 500000) {
           console.warn(`[${req.id}] Audio too large (${outAudio.length} chars) — dropping to protect ESP32`);
           outAudio    = null;
@@ -354,7 +429,6 @@ User Question: ${actualQuestion}`;
       }
 
     } catch (ttsError) {
-      // Non-fatal — OLED still shows answerText even without audio
       console.error(`[${req.id}] TTS failed (non-fatal):`, ttsError.message);
       metrics.errors++;
     }
@@ -365,6 +439,7 @@ User Question: ${actualQuestion}`;
       audio:     outAudio,     // Base64 PCM — null if TTS failed or too large
       mimeType:  outMimeType,  // e.g. "audio/pcm"
       type:      'ai_response',
+      sessionId,               // Return sessionId so ESP32 can reuse it next request
       requestId: req.id
     });
 
@@ -391,23 +466,42 @@ User Question: ${actualQuestion}`;
   }
 });
 
+// ── POST /session/clear — reset a session's memory ────────────────────────
+// Call this from ESP32 on reboot or when user wants Carrot to forget
+app.post('/session/clear', (req, res) => {
+  const { sessionId } = req.body;
+  if (!sessionId) {
+    return res.status(400).json({ error: "Missing 'sessionId' in request body." });
+  }
+  sessionStore.del(sessionId);
+  console.log(`[session:${sessionId}] Memory cleared`);
+  res.json({
+    message:   'Session memory cleared. Carrot has forgotten everything!',
+    sessionId,
+    timestamp: new Date().toISOString()
+  });
+});
+
 // ── GET / ──────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
   res.send('🥕 Carrot AI Backend is Running');
 });
 
-// ── GET /robot — Carrot robot identity & status ────────────────────────────
-// IMPROVEMENT #1 — Useful for ESP32 to confirm backend identity on startup,
-// and for your web dashboard to display robot info.
+// ── GET /robot ─────────────────────────────────────────────────────────────
 app.get('/robot', (_req, res) => {
   res.json({
-    name:     'Carrot',
-    version:  '1.0',
-    status:   'online',
-    modes:    ['ai_mode', 'local_command_mode'],
+    name:      'Carrot',
+    version:   '1.0',
+    status:    'online',
+    modes:     ['ai_mode', 'local_command_mode'],
     wake_words: {
       ai_mode:    'hey carrot',
       local_mode: 'carrot'
+    },
+    memory: {
+      session_ttl_minutes: parseInt(process.env.SESSION_TTL_SEC) / 60,
+      max_history_turns:   parseInt(process.env.MAX_HISTORY_TURNS),
+      active_sessions:     sessionStore.keys().length
     },
     commands: ROBOT_COMMANDS.map(entry => ({
       command:  entry.command.command,
@@ -431,7 +525,6 @@ app.get('/status', (_req, res) => {
 });
 
 // ── GET /health ────────────────────────────────────────────────────────────
-// Lightweight — no live Gemini call (prevents API quota burn on every ping)
 app.get('/health', (req, res) => {
   const healthcheck = {
     requestId:    req.id,
@@ -447,6 +540,7 @@ app.get('/health', (req, res) => {
       totalErrors:     metrics.errors,
       cacheHits:       metrics.cacheHits,
       cachedAnswers:   textCache.keys().length,
+      activeSessions:  sessionStore.keys().length,
       avgResponseTime: `${metrics.avgResponseTime.toFixed(2)}ms`,
       uptime:          `${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m`
     }
@@ -471,10 +565,11 @@ app.get('/metrics', (_req, res) => {
   const runtime = Date.now() - metrics.startTime;
   res.json({
     ...metrics,
-    runtime:       `${Math.floor(runtime / 3600000)}h ${Math.floor((runtime % 3600000) / 60000)}m`,
-    cachedAnswers: textCache.keys().length,
-    memoryUsage:   process.memoryUsage(),
-    timestamp:     new Date().toISOString()
+    runtime:        `${Math.floor(runtime / 3600000)}h ${Math.floor((runtime % 3600000) / 60000)}m`,
+    cachedAnswers:  textCache.keys().length,
+    activeSessions: sessionStore.keys().length,
+    memoryUsage:    process.memoryUsage(),
+    timestamp:      new Date().toISOString()
   });
 });
 
@@ -506,6 +601,8 @@ const server = app.listen(port, () => {
   console.log(`TTS model:   ${process.env.GEMINI_TTS_MODEL}`);
   console.log(`Timeout:     ${process.env.REQUEST_TIMEOUT_MS}ms`);
   console.log(`STT Timeout: ${process.env.STT_TIMEOUT_MS}ms`);
+  console.log(`Session TTL: ${process.env.SESSION_TTL_SEC}s`);
+  console.log(`Max history: ${process.env.MAX_HISTORY_TURNS} turns`);
 });
 
 // ── Graceful Shutdown ──────────────────────────────────────────────────────
@@ -514,7 +611,8 @@ function gracefulShutdown(signal) {
   server.close(() => {
     console.log('HTTP server closed');
     textCache.close();
-    console.log('Cache closed');
+    sessionStore.close();
+    console.log('Cache and session store closed');
     const runtime = Date.now() - metrics.startTime;
     console.log('Final metrics:', {
       ...metrics,
