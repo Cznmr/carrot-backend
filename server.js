@@ -575,6 +575,40 @@ app.get('/metrics', (_req, res) => {
   });
 });
 
+// ── Web Control Command Store ──────────────────────────────────────────────
+// ESP32 polls GET /control every 1-2 seconds
+// Dashboard POSTs to POST /control to set a command
+// Command is consumed (cleared) after ESP32 reads it — one-shot execution
+let pendingWebCommand = null;
+
+// POST /control — dashboard sends a command
+app.post('/control', (req, res) => {
+  const { command } = req.body;
+  const validCommands = ['FORWARD', 'BACKWARD', 'LEFT', 'RIGHT', 'STOP',
+                         'SPEED_UP', 'SLOW_DOWN'];
+  if (!command || !validCommands.includes(command.toUpperCase())) {
+    return res.status(400).json({ error: 'Invalid or missing command.' });
+  }
+  pendingWebCommand = command.toUpperCase();
+  console.log(`[WEB CONTROL] Command queued: ${pendingWebCommand}`);
+  res.json({
+    message:   `Command '${pendingWebCommand}' queued for ESP32`,
+    command:   pendingWebCommand,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// GET /control — ESP32 polls this endpoint
+// Returns command and immediately clears it (one-shot)
+app.get('/control', (req, res) => {
+  const cmd = pendingWebCommand;
+  pendingWebCommand = null; // clear after sending — prevents repeat execution
+  res.json({
+    command:   cmd,         // null if no pending command
+    timestamp: new Date().toISOString()
+  });
+});
+
 // ── 404 Handler ────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({
