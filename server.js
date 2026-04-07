@@ -93,9 +93,9 @@ app.use(helmet({
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }
 }));
 
-// 2mb — incoming audio from INMP441 can be up to ~200KB Base64
-// Response is text-only so outgoing is tiny
-app.use(express.json({ limit: '2mb' }));
+// INCREASED LIMITS to 10mb to prevent Express from dropping large Base64 payloads
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true }));
 
 // ── Request ID Middleware ──────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -201,11 +201,6 @@ const ROBOT_COMMANDS = [
 ];
 
 // ── System Prompt — optimized for ESP32 OLED display ──────────────────────
-// Rules:
-//  1. NO audio data returned ever
-//  2. Text only — max 2-3 short sentences
-//  3. Optimized for 128x64 OLED (21 chars per line, 4 lines visible)
-//  4. Remember conversation context
 const SYSTEM_PROMPT = `You are Carrot, a friendly robot assistant running on an ESP32 microcontroller.
 
 STRICT RULES — you must follow these every single response:
@@ -219,11 +214,6 @@ STRICT RULES — you must follow these every single response:
 Your responses will be shown on a tiny 128x64 OLED screen. Short = better.`;
 
 // ── POST /ask ──────────────────────────────────────────────────────────────
-// Accepts:
-//   { audioData: "<base64>", mimeType: "audio/wav", sessionId: "abc" }
-//   { question:  "hey carrot what is AI",           sessionId: "abc" }
-//
-// Returns TEXT ONLY — no audio in response (ESP32 RAM limitation)
 app.post('/ask', async (req, res) => {
   try {
     const {
@@ -234,12 +224,14 @@ app.post('/ask', async (req, res) => {
     } = req.body;
 
     const sessionId = clientSessionId || uuidv4();
-
-    // ── STEP 0: "The Ear" — STT (audio input only) ────────────────────────
     let transcribedText = '';
 
-    if (incomingAudio) {
-      console.log(`[${req.id}] Audio received — running STT...`);
+    // Bulletproof validation checks
+    const hasAudio = typeof incomingAudio === 'string' && incomingAudio.length > 0;
+    const hasQuestion = typeof question === 'string' && question.trim().length > 0;
+
+    if (hasAudio) {
+      console.log(`[${req.id}] Audio received (${Math.round(incomingAudio.length / 1024)} KB) — running STT...`);
 
       const sttModel  = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
       const sttResult = await withTimeout(
@@ -247,8 +239,8 @@ app.post('/ask', async (req, res) => {
           "Transcribe exactly what the user says. Reply ONLY with the transcribed text. Nothing else.",
           {
             inlineData: {
-              data:     incomingAudio,
-              mimeType: incomingMime || 'audio/wav'
+              data:      incomingAudio,
+              mimeType:  incomingMime || 'audio/wav'
             }
           }
         ]),
@@ -258,7 +250,7 @@ app.post('/ask', async (req, res) => {
       transcribedText = sttResult.response.text()?.trim() || '';
       console.log(`[${req.id}] STT: "${transcribedText}"`);
 
-      // STT failed — return short OLED-safe message, no audio
+      // STT failed
       if (!transcribedText) {
         return res.json({
           answer:    "Didn't catch that. Try again!",
@@ -268,10 +260,14 @@ app.post('/ask', async (req, res) => {
         });
       }
 
-    } else if (question && typeof question === 'string' && question.trim().length > 0) {
+    } else if (hasQuestion) {
       transcribedText = question.trim();
 
     } else {
+      // Extensive logging to debug if ESP32 sends a weird payload
+      console.error(`[${req.id}] VALIDATION_ERROR. Received body keys:`, Object.keys(req.body));
+      if (incomingAudio) console.error(`[${req.id}] audioData length was: ${incomingAudio.length}`);
+      
       throw new CarrotError(
         "Send 'audioData' (Base64 WAV) or 'question' (string)",
         'VALIDATION_ERROR',
@@ -295,7 +291,7 @@ app.post('/ask', async (req, res) => {
       if (matched) {
         console.log(`[${req.id}] Command: ${matched.command.command}`);
         return res.json({
-          answer:    `OK! ${matched.command.command}`,  // short OLED text
+          answer:    `OK! ${matched.command.command}`,  
           command:   matched.command,
           type:      'robot_command',
           sessionId,
@@ -313,13 +309,11 @@ app.post('/ask', async (req, res) => {
       .replace(/^carrot\s*/, '')
       .trim() || cleanQ;
 
-    // Load session history
     const history        = getHistory(sessionId);
     const shouldUseCache = history.length === 0;
     const cacheKey       = `q:${actualQuestion}`;
     let   answerText;
 
-    // Check RAM cache first (no tokens, 5 min)
     if (shouldUseCache) {
       const cached = textCache.get(cacheKey);
       if (cached) {
@@ -329,17 +323,13 @@ app.post('/ask', async (req, res) => {
       }
     }
 
-    // Call Gemini if not cached
     if (!answerText) {
       const chatModel = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
 
       const contents = [
-        // System prompt — first exchange sets personality + rules
         { role: 'user',  parts: [{ text: SYSTEM_PROMPT }] },
         { role: 'model', parts: [{ text: "Understood. I am Carrot. Short text replies only. Ready!" }] },
-        // Session history (remembers past exchanges)
         ...history,
-        // Current question
         { role: 'user',  parts: [{ text: actualQuestion }] }
       ];
 
@@ -349,35 +339,29 @@ app.post('/ask', async (req, res) => {
 
       answerText = chatResult.response.text()?.trim();
 
-      // Fallback if Gemini returns empty
       if (!answerText) {
         answerText = "Hmm, I'm not sure. Ask me again!";
       }
 
-      // Hard truncate — safety net for OLED
-      // 4 lines x 21 chars = 84 chars max comfortable display
-      // Allow slightly more for scrolling displays
+      // Hard truncate for OLED
       if (answerText.length > 120) {
         answerText = answerText.substring(0, 117) + '...';
       }
 
-      // Cache only fresh sessions (no personal context)
       if (shouldUseCache) {
         textCache.set(cacheKey, answerText);
       }
     }
 
-    // Save to session memory
     saveHistory(sessionId, actualQuestion, answerText);
     console.log(`[${req.id}] Answer: "${answerText}"`);
 
-    // ── RESPONSE — text only, no audio field ──────────────────────────────
+    // ── RESPONSE ──────────────────────────────────────────────────────────────
     return res.json({
-      answer:    answerText,   // Plain text — display on OLED
+      answer:    answerText,   
       type:      'ai_response',
-      sessionId,               // ESP32 saves this and sends it next time
+      sessionId,               
       requestId: req.id
-      // NOTE: no 'audio' field — intentionally removed to save ESP32 RAM
     });
 
   } catch (error) {
@@ -421,7 +405,6 @@ app.post('/session/clear', (req, res) => {
 // ── Web Control Command Store ──────────────────────────────────────────────
 let pendingWebCommand = null;
 
-// POST /control — web dashboard sends a movement command
 app.post('/control', (req, res) => {
   const { command } = req.body;
   const valid = ['FORWARD', 'BACKWARD', 'LEFT', 'RIGHT', 'STOP', 'SPEED_UP', 'SLOW_DOWN'];
@@ -439,33 +422,27 @@ app.post('/control', (req, res) => {
   });
 });
 
-// GET /control — ESP32 polls this every 2 seconds
-// One-shot: command is cleared after ESP32 reads it
 app.get('/control', (req, res) => {
   const cmd = pendingWebCommand;
   pendingWebCommand = null;
   res.json({
-    command:   cmd,   // null = no pending command
+    command:   cmd,  
     timestamp: new Date().toISOString()
   });
 });
 
-// ── GET / ──────────────────────────────────────────────────────────────────
+// ── Standard Endpoints ─────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
   res.send('🥕 Carrot AI Backend is Running — Text Only Mode');
 });
 
-// ── GET /robot ─────────────────────────────────────────────────────────────
 app.get('/robot', (_req, res) => {
   res.json({
     name:    'Carrot',
     version: '1.0',
     status:  'online',
     mode:    'text-only (audio-free for ESP32 RAM)',
-    wake_words: {
-      ai_mode:    'hey carrot',
-      local_mode: 'carrot'
-    },
+    wake_words: { ai_mode: 'hey carrot', local_mode: 'carrot' },
     memory: {
       session_ttl_minutes: parseInt(process.env.SESSION_TTL_SEC) / 60,
       max_history_turns:   parseInt(process.env.MAX_HISTORY_TURNS),
@@ -476,7 +453,6 @@ app.get('/robot', (_req, res) => {
   });
 });
 
-// ── GET /status ────────────────────────────────────────────────────────────
 app.get('/status', (_req, res) => {
   const uptime    = process.uptime();
   const uptimeStr = `${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m ${Math.floor(uptime % 60)}s`;
@@ -489,7 +465,6 @@ app.get('/status', (_req, res) => {
   });
 });
 
-// ── GET /health ────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   const healthcheck = {
     requestId:    req.id,
@@ -497,10 +472,7 @@ app.get('/health', (req, res) => {
     timestamp:    new Date().toISOString(),
     status:       'OK',
     mode:         'text-only',
-    dependencies: {
-      gemini: process.env.GEMINI_API_KEY ? 'configured' : 'missing',
-      cache:  'healthy'
-    },
+    dependencies: { gemini: process.env.GEMINI_API_KEY ? 'configured' : 'missing', cache: 'healthy' },
     metrics: {
       totalRequests:   metrics.requests,
       totalErrors:     metrics.errors,
@@ -526,7 +498,6 @@ app.get('/health', (req, res) => {
   res.status(healthcheck.status === 'OK' ? 200 : 503).json(healthcheck);
 });
 
-// ── GET /metrics ───────────────────────────────────────────────────────────
 app.get('/metrics', (_req, res) => {
   const runtime = Date.now() - metrics.startTime;
   res.json({
@@ -539,72 +510,37 @@ app.get('/metrics', (_req, res) => {
   });
 });
 
-// ── 404 Handler ────────────────────────────────────────────────────────────
 app.use((req, res) => {
-  res.status(404).json({
-    error:     'Route not found.',
-    requestId: req.id,
-    timestamp: new Date().toISOString()
-  });
+  res.status(404).json({ error: 'Route not found.', requestId: req.id, timestamp: new Date().toISOString() });
 });
 
-// ── Global Error Handler ───────────────────────────────────────────────────
 app.use((err, req, res, _next) => {
   metrics.errors++;
   console.error(`[${req.id}] Unhandled error:`, err);
-  res.status(500).json({
-    error:     'Something went wrong.',
-    requestId: req.id,
-    timestamp: new Date().toISOString()
-  });
+  res.status(500).json({ error: 'Something went wrong.', requestId: req.id, timestamp: new Date().toISOString() });
 });
 
-// ── Start Server ───────────────────────────────────────────────────────────
 const server = app.listen(port, () => {
   console.log(`🥕 Carrot Backend running on port ${port}`);
   console.log(`Mode:        TEXT ONLY — no audio responses`);
   console.log(`Environment: ${process.env.NODE_ENV}`);
-  console.log(`Chat model:  ${process.env.GEMINI_CHAT_MODEL}`);
-  console.log(`Timeout:     ${process.env.REQUEST_TIMEOUT_MS}ms`);
-  console.log(`STT Timeout: ${process.env.STT_TIMEOUT_MS}ms`);
-  console.log(`Session TTL: ${process.env.SESSION_TTL_SEC}s`);
-  console.log(`Max history: ${process.env.MAX_HISTORY_TURNS} turns`);
 });
 
-// ── Graceful Shutdown ──────────────────────────────────────────────────────
 function gracefulShutdown(signal) {
   console.log(`Received ${signal} — starting graceful shutdown...`);
   server.close(() => {
-    console.log('HTTP server closed');
     textCache.close();
     sessionStore.close();
-    console.log('Cache and session store closed');
-    const runtime = Date.now() - metrics.startTime;
-    console.log('Final metrics:', {
-      ...metrics,
-      runtime:   `${Math.floor(runtime / 3600000)}h ${Math.floor((runtime % 3600000) / 60000)}m`,
-      timestamp: new Date().toISOString()
-    });
     process.exit(0);
   });
   setTimeout(() => {
-    console.error('Force shutdown — connections did not close in time');
     process.exit(1);
   }, 10000);
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error);
-  metrics.errors++;
-  gracefulShutdown('UNCAUGHT_EXCEPTION');
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  metrics.errors++;
-});
+process.on('uncaughtException', (error) => { metrics.errors++; gracefulShutdown('UNCAUGHT_EXCEPTION'); });
+process.on('unhandledRejection', (reason, promise) => { metrics.errors++; });
 
 module.exports = app;
