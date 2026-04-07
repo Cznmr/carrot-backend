@@ -19,10 +19,8 @@ const optionalEnvVars = {
   STT_TIMEOUT_MS:      20000,
   NODE_ENV:            'production',
   GEMINI_CHAT_MODEL:   'gemini-2.5-flash',
-  GEMINI_TTS_MODEL:    'gemini-2.5-flash-preview-tts',
-  TTS_VOICE_NAME:      'Leda',
-  SESSION_TTL_SEC:     1800,   // 30 min — session memory expires after inactivity
-  MAX_HISTORY_TURNS:   10      // keep last 10 exchanges to avoid huge context windows
+  SESSION_TTL_SEC:     1800,
+  MAX_HISTORY_TURNS:   10
 };
 
 requiredEnvVars.forEach(varName => {
@@ -44,19 +42,13 @@ const app   = express();
 const port  = process.env.PORT;
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// Cache text answers only — never audio blobs (memory safety)
-const textCache = new NodeCache({ stdTTL: 300 }); // 5 min TTL for repeated questions
+// RAM cache — text answers only, 5 min TTL
+const textCache = new NodeCache({ stdTTL: 300 });
 
-// ── Session Memory Store ───────────────────────────────────────────────────
-// Stores conversation history per session so Carrot remembers past exchanges.
-// Key: sessionId (string)
-// Value: array of { role: 'user'|'model', parts: [{ text }] }
-//
-// Sessions expire after SESSION_TTL_SEC seconds of inactivity.
-// Only the last MAX_HISTORY_TURNS exchanges are kept to control context size.
+// Session memory store
 const sessionStore = new NodeCache({
   stdTTL:      parseInt(process.env.SESSION_TTL_SEC),
-  checkperiod: 120   // clean up expired sessions every 2 minutes
+  checkperiod: 120
 });
 
 // ── Custom Error Class ─────────────────────────────────────────────────────
@@ -85,7 +77,7 @@ app.use(cors({
   origin: process.env.NODE_ENV === 'production'
     ? process.env.ALLOWED_ORIGINS?.split(',') || true
     : true,
-  methods:        ['GET', 'POST'],
+  methods:        ['GET', 'POST', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
@@ -101,7 +93,8 @@ app.use(helmet({
   hsts: { maxAge: 31536000, includeSubDomains: true, preload: true }
 }));
 
-// 2mb limit — enough for ~5s INMP441 audio as Base64
+// 2mb — incoming audio from INMP441 can be up to ~200KB Base64
+// Response is text-only so outgoing is tiny
 app.use(express.json({ limit: '2mb' }));
 
 // ── Request ID Middleware ──────────────────────────────────────────────────
@@ -123,8 +116,7 @@ app.use((req, res, next) => {
       url:       req.url,
       status:    res.statusCode,
       duration:  `${duration}ms`,
-      ip:        req.ip,
-      userAgent: req.get('user-agent')
+      ip:        req.ip
     }));
     metrics.requests++;
     metrics.totalResponseTime += duration;
@@ -158,57 +150,49 @@ const withTimeout = (promise, ms = parseInt(process.env.REQUEST_TIMEOUT_MS)) =>
   ]);
 
 // ── Session History Helpers ────────────────────────────────────────────────
-
-// Get existing history for a session, or start fresh
 function getHistory(sessionId) {
   return sessionStore.get(sessionId) || [];
 }
 
-// Append a user turn and a model turn, then trim to MAX_HISTORY_TURNS
-// Each "turn" = one user message + one model reply = 2 entries
 function saveHistory(sessionId, userText, modelText) {
-  const maxTurns   = parseInt(process.env.MAX_HISTORY_TURNS); // exchanges
-  let   history    = getHistory(sessionId);
+  const maxTurns = parseInt(process.env.MAX_HISTORY_TURNS);
+  let   history  = getHistory(sessionId);
 
-  // Append new exchange
   history.push({ role: 'user',  parts: [{ text: userText  }] });
   history.push({ role: 'model', parts: [{ text: modelText }] });
 
-  // Trim oldest turns if over limit (each turn = 2 entries)
   const maxEntries = maxTurns * 2;
   if (history.length > maxEntries) {
     history = history.slice(history.length - maxEntries);
   }
-
-  // Reset TTL on every update so active sessions stay alive
   sessionStore.set(sessionId, history);
 }
 
-// ── Robot Commands (Offline / Local ESP32 Mode) ────────────────────────────
+// ── Robot Commands ─────────────────────────────────────────────────────────
 const ROBOT_COMMANDS = [
   {
     keywords: ['move forward', 'go forward', 'forward', 'move ahead', 'go ahead'],
-    command:  { command: 'FORWARD',   speed: 'normal' }
+    command:  { command: 'FORWARD',  speed: 'normal' }
   },
   {
     keywords: ['move back', 'go back', 'backward', 'move backward', 'reverse'],
-    command:  { command: 'BACKWARD',  speed: 'normal' }
+    command:  { command: 'BACKWARD', speed: 'normal' }
   },
   {
     keywords: ['turn left', 'go left', 'left'],
-    command:  { command: 'LEFT',      angle: 90 }
+    command:  { command: 'LEFT',     angle: 90 }
   },
   {
     keywords: ['turn right', 'go right', 'right'],
-    command:  { command: 'RIGHT',     angle: 90 }
+    command:  { command: 'RIGHT',    angle: 90 }
   },
   {
     keywords: ['stop', 'halt', 'freeze', 'stay'],
-    command:  { command: 'STOP',      emergency: false }
+    command:  { command: 'STOP',     emergency: false }
   },
   {
     keywords: ['go faster', 'speed up', 'faster'],
-    command:  { command: 'SPEED_UP',  increment: 10 }
+    command:  { command: 'SPEED_UP', increment: 10 }
   },
   {
     keywords: ['go slower', 'slow down', 'slower'],
@@ -216,36 +200,51 @@ const ROBOT_COMMANDS = [
   }
 ];
 
+// ── System Prompt — optimized for ESP32 OLED display ──────────────────────
+// Rules:
+//  1. NO audio data returned ever
+//  2. Text only — max 2-3 short sentences
+//  3. Optimized for 128x64 OLED (21 chars per line, 4 lines visible)
+//  4. Remember conversation context
+const SYSTEM_PROMPT = `You are Carrot, a friendly robot assistant running on an ESP32 microcontroller.
+
+STRICT RULES — you must follow these every single response:
+1. Reply in plain text only. No markdown, no bullet points, no symbols.
+2. Maximum 2 sentences. Never more.
+3. Each sentence must be under 20 words.
+4. If you remember something from earlier in this conversation, use it.
+5. Be cheerful and warm but extremely concise.
+6. Never ask follow-up questions.
+
+Your responses will be shown on a tiny 128x64 OLED screen. Short = better.`;
+
 // ── POST /ask ──────────────────────────────────────────────────────────────
-// Accepts either:
+// Accepts:
 //   { audioData: "<base64>", mimeType: "audio/wav", sessionId: "abc" }
 //   { question:  "hey carrot what is AI",           sessionId: "abc" }
 //
-// sessionId is optional — if omitted, a new session is created each request
-// (no memory). ESP32 should generate one UUID on boot and reuse it.
+// Returns TEXT ONLY — no audio in response (ESP32 RAM limitation)
 app.post('/ask', async (req, res) => {
   try {
     const {
       question,
-      audioData: incomingAudio,  // Base64 audio from ESP32 INMP441
-      mimeType:  incomingMime,   // e.g. "audio/wav"
-      sessionId: clientSessionId // ESP32 sends this to maintain memory
+      audioData: incomingAudio,
+      mimeType:  incomingMime,
+      sessionId: clientSessionId
     } = req.body;
 
-    // Use provided sessionId or generate a new one for this request
     const sessionId = clientSessionId || uuidv4();
 
-    // ── STEP 0: "The Ear" — STT via Gemini multimodal ─────────────────────
+    // ── STEP 0: "The Ear" — STT (audio input only) ────────────────────────
     let transcribedText = '';
 
     if (incomingAudio) {
-      console.log(`[${req.id}] Raw audio received from INMP441 — transcribing...`);
+      console.log(`[${req.id}] Audio received — running STT...`);
 
-      const sttModel = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
-
+      const sttModel  = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
       const sttResult = await withTimeout(
         sttModel.generateContent([
-          "Transcribe exactly what the user is saying in this audio. Reply ONLY with the transcribed text, nothing else.",
+          "Transcribe exactly what the user says. Reply ONLY with the transcribed text. Nothing else.",
           {
             inlineData: {
               data:     incomingAudio,
@@ -257,13 +256,12 @@ app.post('/ask', async (req, res) => {
       );
 
       transcribedText = sttResult.response.text()?.trim() || '';
-      console.log(`[${req.id}] STT result: "${transcribedText}"`);
+      console.log(`[${req.id}] STT: "${transcribedText}"`);
 
+      // STT failed — return short OLED-safe message, no audio
       if (!transcribedText) {
         return res.json({
-          answer:    "Sorry, I didn't catch that. Please try again!",
-          audio:     null,
-          mimeType:  null,
+          answer:    "Didn't catch that. Try again!",
           type:      'stt_failure',
           sessionId,
           requestId: req.id
@@ -275,173 +273,111 @@ app.post('/ask', async (req, res) => {
 
     } else {
       throw new CarrotError(
-        "Payload must contain 'audioData' (Base64) or 'question' (string)",
+        "Send 'audioData' (Base64 WAV) or 'question' (string)",
         'VALIDATION_ERROR',
         400
       );
     }
 
-    // Normalise — lowercase, strip punctuation, trim
+    // Normalise
     const cleanQ = transcribedText.toLowerCase().replace(/[.,!?]/g, '').trim();
-    console.log(`[${req.id}] [session:${sessionId}] Cleaned input: "${cleanQ}"`);
+    console.log(`[${req.id}] [session:${sessionId}] Input: "${cleanQ}"`);
 
-    // ── ROUTE 1: OFFLINE / LOCAL COMMAND MODE ─────────────────────────────
-    // Robot commands don't need memory — they are instant physical actions
+    // ── ROUTE 1: ROBOT COMMAND (no AI needed) ─────────────────────────────
     if (cleanQ.startsWith('carrot') && !cleanQ.startsWith('hey carrot')) {
-      console.log(`[${req.id}] Route: LOCAL COMMAND MODE`);
+      console.log(`[${req.id}] Route: ROBOT COMMAND`);
 
       const isolatedCommand = cleanQ.replace(/^carrot\s*/, '').trim();
-      console.log(`[${req.id}] Isolated command: "${isolatedCommand}"`);
-
       const matched = ROBOT_COMMANDS.find(entry =>
         entry.keywords.some(k => isolatedCommand.includes(k))
       );
 
       if (matched) {
-        console.log(`[${req.id}] Matched command: ${matched.command.command}`);
+        console.log(`[${req.id}] Command: ${matched.command.command}`);
         return res.json({
-          answer:    `Executing: ${matched.command.command}`,
+          answer:    `OK! ${matched.command.command}`,  // short OLED text
           command:   matched.command,
-          audio:     null,
-          mimeType:  null,
           type:      'robot_command',
           sessionId,
           requestId: req.id
         });
       }
-
-      console.log(`[${req.id}] No command matched — falling back to AI mode`);
+      console.log(`[${req.id}] No command matched — routing to AI`);
     }
 
-    // ── ROUTE 2: AI BRAIN MODE (with conversation memory) ─────────────────
-    console.log(`[${req.id}] Route: AI BRAIN MODE`);
+    // ── ROUTE 2: AI BRAIN (text answer only, no TTS) ──────────────────────
+    console.log(`[${req.id}] Route: AI BRAIN`);
 
-    // Strip wake words so AI only sees the actual question
     const actualQuestion = cleanQ
       .replace(/^hey carrot\s*/, '')
       .replace(/^carrot\s*/, '')
       .trim() || cleanQ;
 
-    // ── STEP 1: "The Brain" — generate answer with full conversation history
-    // Load this session's conversation history
-    const history = getHistory(sessionId);
-    console.log(`[${req.id}] [session:${sessionId}] History length: ${history.length} entries`);
-
-    // System instruction — defines Carrot's personality and memory behaviour
-// NEW
-const systemInstruction = `You are Carrot, a cute and friendly robot companion.
-You have a memory — you remember everything said earlier in this conversation.
-If the user refers to something previously mentioned (like a name, fact, or topic), use that context in your reply.
-Keep all answers extremely brief, under 10 words." Shorter text = smaller audio file = fits perfectly in RAM. — speak naturally like a friendly robot.`;
-
-    // Build the full conversation to send to Gemini:
-    // [system context as first user turn] + [history] + [new question]
-    const contents = [
-      // Inject system personality as the very first exchange so it's always in context
-      {
-        role:  'user',
-        parts: [{ text: systemInstruction }]
-      },
-      {
-        role:  'model',
-        parts: [{ text: "Got it! I'm Carrot, your friendly robot companion. I'll remember our conversation!" }]
-      },
-      // All previous turns for this session
-      ...history,
-      // The new question from the user
-      {
-        role:  'user',
-        parts: [{ text: actualQuestion }]
-      }
-    ];
-
-    // Note: skip text cache for sessions with history — context changes the answer
+    // Load session history
+    const history        = getHistory(sessionId);
     const shouldUseCache = history.length === 0;
     const cacheKey       = `q:${actualQuestion}`;
     let   answerText;
 
+    // Check RAM cache first (no tokens, 5 min)
     if (shouldUseCache) {
-      const cachedText = textCache.get(cacheKey);
-      if (cachedText) {
-        console.log(`[${req.id}] Cache hit — reusing answer (no history)`);
+      const cached = textCache.get(cacheKey);
+      if (cached) {
+        console.log(`[${req.id}] Cache hit`);
         metrics.cacheHits++;
-        answerText = cachedText;
+        answerText = cached;
       }
     }
 
+    // Call Gemini if not cached
     if (!answerText) {
-      const chatModel  = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
+      const chatModel = genAI.getGenerativeModel({ model: process.env.GEMINI_CHAT_MODEL });
+
+      const contents = [
+        // System prompt — first exchange sets personality + rules
+        { role: 'user',  parts: [{ text: SYSTEM_PROMPT }] },
+        { role: 'model', parts: [{ text: "Understood. I am Carrot. Short text replies only. Ready!" }] },
+        // Session history (remembers past exchanges)
+        ...history,
+        // Current question
+        { role: 'user',  parts: [{ text: actualQuestion }] }
+      ];
+
       const chatResult = await withTimeout(
         chatModel.generateContent({ contents })
       );
 
       answerText = chatResult.response.text()?.trim();
+
+      // Fallback if Gemini returns empty
       if (!answerText) {
-        answerText = "Sorry, I couldn't think of an answer!";
+        answerText = "Hmm, I'm not sure. Ask me again!";
       }
 
-      // Only cache if this is a fresh session (no prior context)
+      // Hard truncate — safety net for OLED
+      // 4 lines x 21 chars = 84 chars max comfortable display
+      // Allow slightly more for scrolling displays
+      if (answerText.length > 120) {
+        answerText = answerText.substring(0, 117) + '...';
+      }
+
+      // Cache only fresh sessions (no personal context)
       if (shouldUseCache) {
         textCache.set(cacheKey, answerText);
       }
     }
 
-    // Save this exchange to session memory for future requests
+    // Save to session memory
     saveHistory(sessionId, actualQuestion, answerText);
-    console.log(`[${req.id}] [session:${sessionId}] Brain answer: "${answerText}"`);
+    console.log(`[${req.id}] Answer: "${answerText}"`);
 
-    // ── STEP 2: "The Voice Box" — convert answer to audio (non-fatal) ──────
-    let outAudio    = null;
-    let outMimeType = null;
-
-    try {
-      const ttsModel  = genAI.getGenerativeModel({ model: process.env.GEMINI_TTS_MODEL });
-      const ttsResult = await withTimeout(
-        ttsModel.generateContent({
-          contents: [{ role: 'user', parts: [{ text: answerText }] }],
-          generationConfig: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: process.env.TTS_VOICE_NAME }
-              }
-            }
-          }
-        })
-      );
-
-      const parts     = ttsResult.response.candidates?.[0]?.content?.parts ?? [];
-      const audioPart = parts.find(p => p.inlineData?.data);
-
-      if (audioPart) {
-        outAudio    = audioPart.inlineData.data;
-        outMimeType = audioPart.inlineData.mimeType;
-
-        // Safety cap — drop audio if too large for ESP32 to buffer
-        if (outAudio.length > 500000) {
-          console.warn(`[${req.id}] Audio too large (${outAudio.length} chars) — dropping to protect ESP32`);
-          outAudio    = null;
-          outMimeType = null;
-        } else {
-          console.log(`[${req.id}] TTS audio generated (${outMimeType}, ${outAudio.length} chars)`);
-        }
-      } else {
-        console.warn(`[${req.id}] TTS returned no audio — text-only response`);
-      }
-
-    } catch (ttsError) {
-      console.error(`[${req.id}] TTS failed (non-fatal):`, ttsError.message);
-      metrics.errors++;
-    }
-
-    // Always return answer text — OLED animation never breaks
+    // ── RESPONSE — text only, no audio field ──────────────────────────────
     return res.json({
-      answer:    answerText,   // Always present — ESP32 OLED safe
-      audio:     outAudio,     // Base64 PCM — null if TTS failed or too large
-      mimeType:  outMimeType,  // e.g. "audio/pcm"
+      answer:    answerText,   // Plain text — display on OLED
       type:      'ai_response',
-      sessionId,               // Return sessionId so ESP32 can reuse it next request
+      sessionId,               // ESP32 saves this and sends it next time
       requestId: req.id
+      // NOTE: no 'audio' field — intentionally removed to save ESP32 RAM
     });
 
   } catch (error) {
@@ -467,34 +403,65 @@ Keep all answers extremely brief, under 10 words." Shorter text = smaller audio 
   }
 });
 
-// ── POST /session/clear — reset a session's memory ────────────────────────
-// Call this from ESP32 on reboot or when user wants Carrot to forget
+// ── POST /session/clear ────────────────────────────────────────────────────
 app.post('/session/clear', (req, res) => {
   const { sessionId } = req.body;
   if (!sessionId) {
-    return res.status(400).json({ error: "Missing 'sessionId' in request body." });
+    return res.status(400).json({ error: "Missing 'sessionId'." });
   }
   sessionStore.del(sessionId);
-  console.log(`[session:${sessionId}] Memory cleared`);
+  console.log(`[session:${sessionId}] Cleared`);
   res.json({
-    message:   'Session memory cleared. Carrot has forgotten everything!',
+    message:   'Carrot has forgotten everything!',
     sessionId,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ── Web Control Command Store ──────────────────────────────────────────────
+let pendingWebCommand = null;
+
+// POST /control — web dashboard sends a movement command
+app.post('/control', (req, res) => {
+  const { command } = req.body;
+  const valid = ['FORWARD', 'BACKWARD', 'LEFT', 'RIGHT', 'STOP', 'SPEED_UP', 'SLOW_DOWN'];
+
+  if (!command || !valid.includes(command.toUpperCase())) {
+    return res.status(400).json({ error: 'Invalid command.' });
+  }
+
+  pendingWebCommand = command.toUpperCase();
+  console.log(`[WEB CTRL] Queued: ${pendingWebCommand}`);
+  res.json({
+    message:   `Command '${pendingWebCommand}' queued for ESP32`,
+    command:   pendingWebCommand,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// GET /control — ESP32 polls this every 2 seconds
+// One-shot: command is cleared after ESP32 reads it
+app.get('/control', (req, res) => {
+  const cmd = pendingWebCommand;
+  pendingWebCommand = null;
+  res.json({
+    command:   cmd,   // null = no pending command
     timestamp: new Date().toISOString()
   });
 });
 
 // ── GET / ──────────────────────────────────────────────────────────────────
 app.get('/', (_req, res) => {
-  res.send('🥕 Carrot AI Backend is Running');
+  res.send('🥕 Carrot AI Backend is Running — Text Only Mode');
 });
 
 // ── GET /robot ─────────────────────────────────────────────────────────────
 app.get('/robot', (_req, res) => {
   res.json({
-    name:      'Carrot',
-    version:   '1.0',
-    status:    'online',
-    modes:     ['ai_mode', 'local_command_mode'],
+    name:    'Carrot',
+    version: '1.0',
+    status:  'online',
+    mode:    'text-only (audio-free for ESP32 RAM)',
     wake_words: {
       ai_mode:    'hey carrot',
       local_mode: 'carrot'
@@ -504,10 +471,7 @@ app.get('/robot', (_req, res) => {
       max_history_turns:   parseInt(process.env.MAX_HISTORY_TURNS),
       active_sessions:     sessionStore.keys().length
     },
-    commands: ROBOT_COMMANDS.map(entry => ({
-      command:  entry.command.command,
-      keywords: entry.keywords
-    })),
+    commands:  ROBOT_COMMANDS.map(e => ({ command: e.command.command, keywords: e.keywords })),
     timestamp: new Date().toISOString()
   });
 });
@@ -532,6 +496,7 @@ app.get('/health', (req, res) => {
     uptime:       process.uptime(),
     timestamp:    new Date().toISOString(),
     status:       'OK',
+    mode:         'text-only',
     dependencies: {
       gemini: process.env.GEMINI_API_KEY ? 'configured' : 'missing',
       cache:  'healthy'
@@ -574,40 +539,6 @@ app.get('/metrics', (_req, res) => {
   });
 });
 
-// ── Web Control Command Store ──────────────────────────────────────────────
-// ESP32 polls GET /control every 1-2 seconds
-// Dashboard POSTs to POST /control to set a command
-// Command is consumed (cleared) after ESP32 reads it — one-shot execution
-let pendingWebCommand = null;
-
-// POST /control — dashboard sends a command
-app.post('/control', (req, res) => {
-  const { command } = req.body;
-  const validCommands = ['FORWARD', 'BACKWARD', 'LEFT', 'RIGHT', 'STOP',
-                         'SPEED_UP', 'SLOW_DOWN'];
-  if (!command || !validCommands.includes(command.toUpperCase())) {
-    return res.status(400).json({ error: 'Invalid or missing command.' });
-  }
-  pendingWebCommand = command.toUpperCase();
-  console.log(`[WEB CONTROL] Command queued: ${pendingWebCommand}`);
-  res.json({
-    message:   `Command '${pendingWebCommand}' queued for ESP32`,
-    command:   pendingWebCommand,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// GET /control — ESP32 polls this endpoint
-// Returns command and immediately clears it (one-shot)
-app.get('/control', (req, res) => {
-  const cmd = pendingWebCommand;
-  pendingWebCommand = null; // clear after sending — prevents repeat execution
-  res.json({
-    command:   cmd,         // null if no pending command
-    timestamp: new Date().toISOString()
-  });
-});
-
 // ── 404 Handler ────────────────────────────────────────────────────────────
 app.use((req, res) => {
   res.status(404).json({
@@ -631,9 +562,9 @@ app.use((err, req, res, _next) => {
 // ── Start Server ───────────────────────────────────────────────────────────
 const server = app.listen(port, () => {
   console.log(`🥕 Carrot Backend running on port ${port}`);
+  console.log(`Mode:        TEXT ONLY — no audio responses`);
   console.log(`Environment: ${process.env.NODE_ENV}`);
   console.log(`Chat model:  ${process.env.GEMINI_CHAT_MODEL}`);
-  console.log(`TTS model:   ${process.env.GEMINI_TTS_MODEL}`);
   console.log(`Timeout:     ${process.env.REQUEST_TIMEOUT_MS}ms`);
   console.log(`STT Timeout: ${process.env.STT_TIMEOUT_MS}ms`);
   console.log(`Session TTL: ${process.env.SESSION_TTL_SEC}s`);
